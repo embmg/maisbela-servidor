@@ -7,28 +7,35 @@ const P = require('pino');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(express.json());
 
-// Chave secreta que o app Android precisa enviar para poder mandar mensagens.
-// Configure isso como Variável de Ambiente na Render (passo mais à frente),
-// em vez de deixar fixo aqui no código.
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
 
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
 let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desconectado
+let ultimoMotivoDesconexao = '';
 
 async function iniciarConexaoWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
+  // Busca automaticamente a versão mais atual do protocolo do WhatsApp Web.
+  // Sem isso, o servidor pode ficar "preso" numa versão antiga e o QR code
+  // parece escanear, mas nunca completa a conexão de verdade.
+  const { version } = await fetchLatestBaileysVersion();
+  console.log('Usando versão do WhatsApp Web:', version);
+
   socketWhatsApp = makeWASocket({
+    version,
     auth: state,
     logger: P({ level: 'silent' }),
-    printQRInTerminal: false
+    printQRInTerminal: false,
+    browser: ['MaisBela', 'Chrome', '1.0.0']
   });
 
   socketWhatsApp.ev.on('creds.update', saveCreds);
@@ -39,7 +46,7 @@ async function iniciarConexaoWhatsApp() {
     if (qr) {
       ultimoQrCodeBase64 = await qrcode.toDataURL(qr);
       statusConexao = 'aguardando_qr';
-      console.log('Novo QR code gerado — acesse /qr no navegador para escanear.');
+      console.log('Novo QR code gerado — acesse /qr e escaneie rápido (expira em ~60s).');
     }
 
     if (connection === 'open') {
@@ -51,6 +58,7 @@ async function iniciarConexaoWhatsApp() {
     if (connection === 'close') {
       statusConexao = 'desconectado';
       const motivo = lastDisconnect?.error?.output?.statusCode;
+      ultimoMotivoDesconexao = String(motivo || 'desconhecido');
       const deveReconectar = motivo !== DisconnectReason.loggedOut;
       console.log('Conexão fechada. Motivo:', motivo, '| Vai reconectar:', deveReconectar);
       if (deveReconectar) {
@@ -62,26 +70,35 @@ async function iniciarConexaoWhatsApp() {
 
 iniciarConexaoWhatsApp();
 
-// Página simples para você escanear o QR code pelo navegador do celular.
+// Página do QR code, com atualização automática a cada 15 segundos —
+// assim você nunca escaneia um código já vencido por acidente.
 app.get('/qr', (req, res) => {
   if (statusConexao === 'conectado') {
     return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
   }
   if (!ultimoQrCodeBase64) {
-    return res.send('<h2>Aguardando gerar o QR code... atualize a página em alguns segundos.</h2>');
+    return res.send(`
+      <html>
+        <head><meta http-equiv="refresh" content="5"></head>
+        <body style="text-align:center; font-family: sans-serif;">
+          <h2>Gerando QR code... esta página atualiza sozinha em 5 segundos.</h2>
+        </body>
+      </html>
+    `);
   }
   res.send(`
     <html>
+      <head><meta http-equiv="refresh" content="15"></head>
       <body style="text-align:center; font-family: sans-serif;">
         <h2>Escaneie este código com o WhatsApp do salão</h2>
         <p>WhatsApp > Aparelhos conectados > Conectar um aparelho</p>
         <img src="${ultimoQrCodeBase64}" style="width:300px;" />
+        <p style="color:#888;">Esta página atualiza sozinha a cada 15 segundos com um QR novo, se precisar.</p>
       </body>
     </html>
   `);
 });
 
-// Endpoint que o app Android chama para mandar mensagem de verdade, em segundo plano.
 app.post('/enviar', async (req, res) => {
   const chaveRecebida = req.headers['x-chave-secreta'];
   if (chaveRecebida !== CHAVE_SECRETA) {
@@ -107,13 +124,10 @@ app.post('/enviar', async (req, res) => {
   }
 });
 
-// A Render "cutuca" esse endereço para saber se o serviço está de pé — e é
-// esse mesmo endereço que o UptimeRobot vai chamar a cada 5 minutos.
 app.get('/status', (req, res) => {
-  res.json({ status: statusConexao });
+  res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
 
-// IMPORTANTE: a Render define automaticamente a porta certa pela variável PORT.
 const PORTA = process.env.PORT || 3000;
 app.listen(PORTA, () => {
   console.log(`Servidor do MaisBela rodando na porta ${PORTA}`);
