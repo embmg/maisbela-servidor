@@ -1,6 +1,7 @@
 // Servidor do MaisBela: mantém uma conexão com o WhatsApp e envia mensagens
 // automaticamente quando o app Android pede, sem precisar abrir o WhatsApp.
 
+const fs = require('fs');
 const express = require('express');
 const qrcode = require('qrcode');
 const P = require('pino');
@@ -15,6 +16,7 @@ const app = express();
 app.use(express.json());
 
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
+const PASTA_SESSAO = 'auth_info';
 
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
@@ -22,9 +24,8 @@ let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desc
 let ultimoMotivoDesconexao = '';
 
 async function iniciarConexaoWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
 
-  // Busca automaticamente a versão mais atual do protocolo do WhatsApp Web.
   const { version } = await fetchLatestBaileysVersion();
   console.log('Usando versão do WhatsApp Web:', version);
 
@@ -57,9 +58,26 @@ async function iniciarConexaoWhatsApp() {
       statusConexao = 'desconectado';
       const motivo = lastDisconnect?.error?.output?.statusCode;
       ultimoMotivoDesconexao = String(motivo || 'desconhecido');
-      const deveReconectar = motivo !== DisconnectReason.loggedOut;
-      console.log('Conexão fechada. Motivo:', motivo, '| Vai reconectar:', deveReconectar);
-      if (deveReconectar) {
+      const foiLogout = motivo === DisconnectReason.loggedOut;
+
+      console.log('Conexão fechada. Motivo:', motivo, '| Foi logout:', foiLogout);
+
+      if (foiLogout) {
+        // A sessão antiga ficou inválida. Apaga os arquivos dela e já
+        // reinicia sozinho para gerar um QR code novo automaticamente,
+        // em vez de ficar parado esperando um comando que nunca chega.
+        console.log('Logout detectado — limpando sessão antiga e gerando novo QR code...');
+        try {
+          fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
+        } catch (e) {
+          console.error('Erro ao limpar pasta de sessão:', e);
+        }
+        statusConexao = 'iniciando';
+        ultimoQrCodeBase64 = null;
+        iniciarConexaoWhatsApp();
+      } else {
+        // Qualquer outro tipo de desconexão (queda de rede, reinício do
+        // servidor, etc.) — reconecta normalmente, mantendo a sessão.
         iniciarConexaoWhatsApp();
       }
     }
@@ -68,25 +86,8 @@ async function iniciarConexaoWhatsApp() {
 
 iniciarConexaoWhatsApp();
 
-// Página inicial para substituir a mensagem "Cannot GET /"
-app.get('/', (req, res) => {
-  const corStatus = statusConexao === 'conectado' ? '#2e7d32' : '#c62828';
-  res.send(`
-    <html>
-      <head><title>Servidor MaisBela</title></head>
-      <body style="text-align:center; font-family: sans-serif; padding-top: 50px;">
-        <h2>🟢 Servidor MaisBela está Online!</h2>
-        <p>Status atual da conexão: <strong style="color: ${corStatus};">${statusConexao.toUpperCase()}</strong></p>
-        <br/>
-        <a href="/qr" style="padding: 12px 20px; background-color: #008069; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">
-          Acessar Página do QR Code
-        </a>
-      </body>
-    </html>
-  `);
-});
-
-// Página do QR code, com atualização automática a cada 15 segundos
+// Página do QR code, com atualização automática a cada 15 segundos —
+// assim você nunca escaneia um código já vencido por acidente.
 app.get('/qr', (req, res) => {
   if (statusConexao === 'conectado') {
     return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
@@ -112,6 +113,18 @@ app.get('/qr', (req, res) => {
       </body>
     </html>
   `);
+});
+
+// Botão de emergência: força limpar a sessão e gerar QR novo na hora,
+// sem precisar esperar um logout real acontecer.
+app.get('/reconectar', async (req, res) => {
+  try {
+    fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
+  } catch (e) {}
+  statusConexao = 'iniciando';
+  ultimoQrCodeBase64 = null;
+  await iniciarConexaoWhatsApp();
+  res.send('<h2>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
 });
 
 app.post('/enviar', async (req, res) => {
