@@ -25,8 +25,6 @@ async function iniciarConexaoWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
   // Busca automaticamente a versão mais atual do protocolo do WhatsApp Web.
-  // Sem isso, o servidor pode ficar "preso" numa versão antiga e o QR code
-  // parece escanear, mas nunca completa a conexão de verdade.
   const { version } = await fetchLatestBaileysVersion();
   console.log('Usando versão do WhatsApp Web:', version);
 
@@ -70,8 +68,25 @@ async function iniciarConexaoWhatsApp() {
 
 iniciarConexaoWhatsApp();
 
-// Página do QR code, com atualização automática a cada 15 segundos —
-// assim você nunca escaneia um código já vencido por acidente.
+// Página inicial para substituir a mensagem "Cannot GET /"
+app.get('/', (req, res) => {
+  const corStatus = statusConexao === 'conectado' ? '#2e7d32' : '#c62828';
+  res.send(`
+    <html>
+      <head><title>Servidor MaisBela</title></head>
+      <body style="text-align:center; font-family: sans-serif; padding-top: 50px;">
+        <h2>🟢 Servidor MaisBela está Online!</h2>
+        <p>Status atual da conexão: <strong style="color: ${corStatus};">${statusConexao.toUpperCase()}</strong></p>
+        <br/>
+        <a href="/qr" style="padding: 12px 20px; background-color: #008069; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">
+          Acessar Página do QR Code
+        </a>
+      </body>
+    </html>
+  `);
+});
+
+// Página do QR code, com atualização automática a cada 15 segundos
 app.get('/qr', (req, res) => {
   if (statusConexao === 'conectado') {
     return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
