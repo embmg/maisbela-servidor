@@ -25,80 +25,6 @@ let ultimoMotivoDesconexao = '';
 let conectando = false;
 let respostasPendentes = [];
 
-let badMacSeguidos = 0;
-let limpandoSessao = false;
-let timerZerarBadMac = null;
-
-function contarBadMac() {
-  badMacSeguidos++;
-  clearTimeout(timerZerarBadMac);
-  timerZerarBadMac = setTimeout(() => { badMacSeguidos = 0; }, 60 * 1000);
-
-  if (badMacSeguidos >= 20) {
-    tratarBadMac();
-  }
-}
-
-async function tratarBadMac() {
-  if (limpandoSessao) return;
-  limpandoSessao = true;
-  badMacSeguidos = 0;
-  console.log('⚠️ Sessão corrompida (Bad MAC repetido). Limpando e gerando QR novo...');
-
-  try { fs.rmSync(PASTA_SESSAO, { recursive: true, force: true }); } catch (_) {}
-  statusConexao = 'iniciando';
-  ultimoQrCodeBase64 = null;
-
-  try { socketWhatsApp?.ws?.close(); } catch (_) {}
-  try { socketWhatsApp?.end?.(new Error('bad-mac-recovery')); } catch (_) {}
-
-  conectando = false;
-  setTimeout(() => { limpandoSessao = false; iniciarConexaoWhatsApp(); }, 2000);
-}
-
-/** Verifica se o texto recebido é um erro de sessão (Bad MAC, no matching sessions). */
-function ehErroDeSessao(...partes) {
-  const texto = partes.map((p) => {
-    if (p == null) return '';
-    if (typeof p === 'string') return p;
-    if (typeof p === 'object') {
-      return String(p.message || '') + ' ' + String(p.err?.message || '') + ' ' + String(p.stack || '');
-    }
-    return String(p);
-  }).join(' ');
-  return texto.includes('Bad MAC') || texto.includes('No matching sessions');
-}
-
-// Intercepta o console.error diretamente, porque o Baileys usa essa via
-// para logar os Bad MAC em alguns casos (não passa pelo logger pino).
-const consoleErrorOriginal = console.error.bind(console);
-console.error = (...args) => {
-  if (ehErroDeSessao(...args)) {
-    contarBadMac();
-  }
-  consoleErrorOriginal(...args);
-};
-
-function criarLoggerComContadorBadMac() {
-  const loggerBase = P({ level: 'error' });
-  return {
-    level: 'error',
-    fatal: (...args) => {
-      if (ehErroDeSessao(...args)) contarBadMac();
-      loggerBase.fatal(...args);
-    },
-    error: (...args) => {
-      if (ehErroDeSessao(...args)) contarBadMac();
-      loggerBase.error(...args);
-    },
-    warn: () => {},
-    info: () => {},
-    debug: () => {},
-    trace: () => {},
-    child: () => criarLoggerComContadorBadMac()
-  };
-}
-
 function normalizarTexto(texto) {
   return texto
     .normalize('NFD')
@@ -147,20 +73,14 @@ async function iniciarConexaoWhatsApp() {
     socketWhatsApp = makeWASocket({
       version,
       auth: state,
-      logger: criarLoggerComContadorBadMac(),
+      logger: P({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: ['MaisBela', 'Chrome', '1.0.0'],
-      getMessage: async () => undefined,
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: false
+      browser: ['MaisBela', 'Chrome', '1.0.0']
     });
 
     socketWhatsApp.ev.on('creds.update', saveCreds);
 
     socketWhatsApp.ev.on('messages.upsert', ({ messages, type }) => {
-      badMacSeguidos = 0;
-
       if (type !== 'notify') return;
 
       for (const msg of messages) {
@@ -205,7 +125,6 @@ async function iniciarConexaoWhatsApp() {
         statusConexao = 'conectado';
         ultimoQrCodeBase64 = null;
         conectando = false;
-        badMacSeguidos = 0;
         console.log('✅ Conectado ao WhatsApp!');
       }
 
@@ -255,7 +174,7 @@ app.get('/qr', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ status: statusConexao, ultimoMotivoDesconexao, badMacSeguidos });
+  res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
 
 // ---------- Rotas autenticadas ----------
@@ -277,7 +196,6 @@ app.get('/reconectar', async (req, res) => {
   statusConexao = 'iniciando';
   ultimoQrCodeBase64 = null;
   conectando = false;
-  badMacSeguidos = 0;
   await iniciarConexaoWhatsApp();
   res.send('<h2>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
 });
