@@ -1,6 +1,4 @@
-// Servidor do MaisBela: mantém uma conexão com o WhatsApp e envia mensagens
-// automaticamente quando o app Android pede, sem precisar abrir o WhatsApp.
-
+// Servidor do MaisBela — envia mensagens e escuta CONFIRMAR/CANCELAR.
 const fs = require('fs');
 const express = require('express');
 const qrcode = require('qrcode');
@@ -17,146 +15,223 @@ app.use(express.json());
 
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
 const PASTA_SESSAO = 'auth_info';
+const TTL_RESPOSTA_MS = 1000 * 60 * 60 * 12; // descarta respostas com +12h
+const MAX_RESPOSTAS = 500;
 
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
-let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desconectado
+let statusConexao = 'iniciando';
 let ultimoMotivoDesconexao = '';
+let conectando = false; // trava contra reconexões duplicadas
+
+let respostasPendentes = [];
+
+function normalizarTexto(texto) {
+  return texto
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase()
+    .trim();
+}
+
+/**
+ * Detecta intenção de confirmar/cancelar apenas quando a mensagem é
+ * essencialmente isso. Evita casar com "não vou confirmar", "já confirmei" etc.
+ */
+function detectarAcao(textoOriginal) {
+  const t = normalizarTexto(textoOriginal);
+  // Pega a primeira palavra significativa (ignora emojis/pontuação).
+  const primeira = (t.match(/[A-Z]+/) || [''])[0];
+
+  const negativos = ['NAO', 'NUNCA', 'JAMAIS', 'DEPOIS', 'AMANHA', 'TALVEZ'];
+
+  if (primeira.startsWith('CONFIRMAR') || primeira === 'CONFIRMO' || primeira === 'SIM') {
+    // Se a frase contém negação logo antes, descarta.
+    const idx = t.indexOf(primeira);
+    const antes = t.slice(Math.max(0, idx - 10), idx);
+    if (negativos.some((n) => antes.includes(n))) return null;
+    return 'confirmar';
+  }
+  if (primeira.startsWith('CANCELAR') || primeira === 'CANCELO' || primeira === 'NAO') {
+    // "NÃO" só conta como cancelar se for a primeira palavra.
+    if (primeira === 'NAO' && !t.startsWith('NAO')) return null;
+    return 'cancelar';
+  }
+  return null;
+}
+
+function limparRespostasAntigas() {
+  const agora = Date.now();
+  respostasPendentes = respostasPendentes
+    .filter((r) => agora - r.timestamp < TTL_RESPOSTA_MS)
+    .slice(-MAX_RESPOSTAS);
+}
 
 async function iniciarConexaoWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
+  if (conectando) {
+    console.log('Já existe uma conexão em andamento — ignorando chamada duplicada.');
+    return;
+  }
+  conectando = true;
 
-  const { version } = await fetchLatestBaileysVersion();
-  console.log('Usando versão do WhatsApp Web:', version);
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
+    const { version } = await fetchLatestBaileysVersion();
+    console.log('Usando versão do WhatsApp Web:', version);
 
-  socketWhatsApp = makeWASocket({
-    version,
-    auth: state,
-    logger: P({ level: 'silent' }),
-    printQRInTerminal: false,
-    browser: ['MaisBela', 'Chrome', '1.0.0']
-  });
+    socketWhatsApp = makeWASocket({
+      version,
+      auth: state,
+      logger: P({ level: 'silent' }),
+      printQRInTerminal: false,
+      browser: ['MaisBela', 'Chrome', '1.0.0']
+    });
 
-  socketWhatsApp.ev.on('creds.update', saveCreds);
+    socketWhatsApp.ev.on('creds.update', saveCreds);
 
-  socketWhatsApp.ev.on('connection.update', async (atualizacao) => {
-    const { connection, lastDisconnect, qr } = atualizacao;
+    socketWhatsApp.ev.on('messages.upsert', ({ messages, type }) => {
+      if (type !== 'notify') return; // ignora histórico/sincronização
 
-    if (qr) {
-      ultimoQrCodeBase64 = await qrcode.toDataURL(qr);
-      statusConexao = 'aguardando_qr';
-      console.log('Novo QR code gerado — acesse /qr e escaneie rápido (expira em ~60s).');
-    }
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        if (msg.key.fromMe) continue;
+        const jid = msg.key.remoteJid || '';
+        if (jid.endsWith('@g.us')) continue;        // grupos
+        if (jid === 'status@broadcast') continue;   // status
+        if (jid.endsWith('@broadcast')) continue;   // listas
 
-    if (connection === 'open') {
-      statusConexao = 'conectado';
-      ultimoQrCodeBase64 = null;
-      console.log('✅ Conectado ao WhatsApp com sucesso!');
-    }
+        const textoRecebido =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          msg.message.buttonsResponseMessage?.selectedButtonId ||
+          msg.message.listResponseMessage?.singleSelectReply?.selectedRowId ||
+          '';
 
-    if (connection === 'close') {
-      statusConexao = 'desconectado';
-      const motivo = lastDisconnect?.error?.output?.statusCode;
-      ultimoMotivoDesconexao = String(motivo || 'desconhecido');
-      const foiLogout = motivo === DisconnectReason.loggedOut;
+        if (!textoRecebido) continue;
 
-      console.log('Conexão fechada. Motivo:', motivo, '| Foi logout:', foiLogout);
+        const acao = detectarAcao(textoRecebido);
+        if (!acao) continue;
 
-      if (foiLogout) {
-        // A sessão antiga ficou inválida. Apaga os arquivos dela e já
-        // reinicia sozinho para gerar um QR code novo automaticamente,
-        // em vez de ficar parado esperando um comando que nunca chega.
-        console.log('Logout detectado — limpando sessão antiga e gerando novo QR code...');
-        try {
-          fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
-        } catch (e) {
-          console.error('Erro ao limpar pasta de sessão:', e);
-        }
-        statusConexao = 'iniciando';
-        ultimoQrCodeBase64 = null;
-        iniciarConexaoWhatsApp();
-      } else {
-        // Qualquer outro tipo de desconexão (queda de rede, reinício do
-        // servidor, etc.) — reconecta normalmente, mantendo a sessão.
-        iniciarConexaoWhatsApp();
+        const telefone = jid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+        if (!telefone) continue;
+
+        console.log(`Resposta de ${telefone}: ${acao.toUpperCase()}`);
+        respostasPendentes.push({ telefone, acao, timestamp: Date.now() });
+        limparRespostasAntigas();
       }
-    }
-  });
+    });
+
+    socketWhatsApp.ev.on('connection.update', async (atualizacao) => {
+      const { connection, lastDisconnect, qr } = atualizacao;
+
+      if (qr) {
+        ultimoQrCodeBase64 = await qrcode.toDataURL(qr);
+        statusConexao = 'aguardando_qr';
+        console.log('Novo QR gerado — acesse /qr (expira em ~60s).');
+      }
+
+      if (connection === 'open') {
+        statusConexao = 'conectado';
+        ultimoQrCodeBase64 = null;
+        conectando = false;
+        console.log('✅ Conectado ao WhatsApp!');
+      }
+
+      if (connection === 'close') {
+        statusConexao = 'desconectado';
+        const motivo = lastDisconnect?.error?.output?.statusCode;
+        ultimoMotivoDesconexao = String(motivo || 'desconhecido');
+        const foiLogout = motivo === DisconnectReason.loggedOut;
+        console.log('Conexão fechada. Motivo:', motivo, '| Logout:', foiLogout);
+
+        conectando = false; // libera trava para reconectar
+
+        if (foiLogout) {
+          console.log('Logout detectado — limpando sessão e gerando novo QR...');
+          try { fs.rmSync(PASTA_SESSAO, { recursive: true, force: true }); } catch (_) {}
+          statusConexao = 'iniciando';
+          ultimoQrCodeBase64 = null;
+          setTimeout(iniciarConexaoWhatsApp, 1000);
+        } else {
+          setTimeout(iniciarConexaoWhatsApp, 3000); // backoff curto
+        }
+      }
+    });
+  } catch (e) {
+    conectando = false;
+    console.error('Erro ao iniciar conexão:', e);
+  }
 }
 
 iniciarConexaoWhatsApp();
 
-// Página do QR code, com atualização automática a cada 15 segundos —
-// assim você nunca escaneia um código já vencido por acidente.
+// ---------- Rotas públicas ----------
+
 app.get('/qr', (req, res) => {
-  if (statusConexao === 'conectado') {
-    return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
-  }
+  if (statusConexao === 'conectado') return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
   if (!ultimoQrCodeBase64) {
-    return res.send(`
-      <html>
-        <head><meta http-equiv="refresh" content="5"></head>
-        <body style="text-align:center; font-family: sans-serif;">
-          <h2>Gerando QR code... esta página atualiza sozinha em 5 segundos.</h2>
-        </body>
-      </html>
-    `);
+    return res.send(`<html><head><meta http-equiv="refresh" content="5"></head>
+      <body style="text-align:center;font-family:sans-serif;">
+      <h2>Gerando QR code... atualiza em 5s.</h2></body></html>`);
   }
-  res.send(`
-    <html>
-      <head><meta http-equiv="refresh" content="15"></head>
-      <body style="text-align:center; font-family: sans-serif;">
-        <h2>Escaneie este código com o WhatsApp do salão</h2>
-        <p>WhatsApp > Aparelhos conectados > Conectar um aparelho</p>
-        <img src="${ultimoQrCodeBase64}" style="width:300px;" />
-        <p style="color:#888;">Esta página atualiza sozinha a cada 15 segundos com um QR novo, se precisar.</p>
-      </body>
-    </html>
-  `);
-});
-
-// Botão de emergência: força limpar a sessão e gerar QR novo na hora,
-// sem precisar esperar um logout real acontecer.
-app.get('/reconectar', async (req, res) => {
-  try {
-    fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
-  } catch (e) {}
-  statusConexao = 'iniciando';
-  ultimoQrCodeBase64 = null;
-  await iniciarConexaoWhatsApp();
-  res.send('<h2>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
-});
-
-app.post('/enviar', async (req, res) => {
-  const chaveRecebida = req.headers['x-chave-secreta'];
-  if (chaveRecebida !== CHAVE_SECRETA) {
-    return res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
-  }
-
-  if (statusConexao !== 'conectado') {
-    return res.status(503).json({ sucesso: false, erro: 'WhatsApp não está conectado no momento' });
-  }
-
-  const { telefone, mensagem } = req.body;
-  if (!telefone || !mensagem) {
-    return res.status(400).json({ sucesso: false, erro: 'Envie telefone e mensagem' });
-  }
-
-  try {
-    const numeroFormatado = telefone.replace(/\D/g, '') + '@s.whatsapp.net';
-    await socketWhatsApp.sendMessage(numeroFormatado, { text: mensagem });
-    res.json({ sucesso: true });
-  } catch (erro) {
-    console.error('Erro ao enviar mensagem:', erro);
-    res.status(500).json({ sucesso: false, erro: 'Falha ao enviar mensagem' });
-  }
+  res.send(`<html><head><meta http-equiv="refresh" content="15"></head>
+    <body style="text-align:center;font-family:sans-serif;">
+    <h2>Escaneie com o WhatsApp do salão</h2>
+    <p>WhatsApp > Aparelhos conectados > Conectar um aparelho</p>
+    <img src="${ultimoQrCodeBase64}" style="width:300px;" />
+    <p style="color:#888;">Atualiza sozinho a cada 15s.</p></body></html>`);
 });
 
 app.get('/status', (req, res) => {
   res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
 
-const PORTA = process.env.PORT || 3000;
-app.listen(PORTA, () => {
-  console.log(`Servidor do MaisBela rodando na porta ${PORTA}`);
+// ---------- Rotas autenticadas ----------
+
+function autenticar(req, res) {
+  if (req.headers['x-chave-secreta'] !== CHAVE_SECRETA) {
+    res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/reconectar', async (req, res) => {
+  if (!autenticar(req, res)) return;
+  try { fs.rmSync(PASTA_SESSAO, { recursive: true, force: true }); } catch (_) {}
+  statusConexao = 'iniciando';
+  ultimoQrCodeBase64 = null;
+  conectando = false;
+  await iniciarConexaoWhatsApp();
+  res.send('<h2>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
 });
+
+app.post('/enviar', async (req, res) => {
+  if (!autenticar(req, res)) return;
+  if (statusConexao !== 'conectado') {
+    return res.status(503).json({ sucesso: false, erro: 'WhatsApp não conectado' });
+  }
+  const { telefone, mensagem } = req.body;
+  if (!telefone || !mensagem) {
+    return res.status(400).json({ sucesso: false, erro: 'Envie telefone e mensagem' });
+  }
+  try {
+    const numero = telefone.replace(/\D/g, '') + '@s.whatsapp.net';
+    await socketWhatsApp.sendMessage(numero, { text: mensagem });
+    res.json({ sucesso: true });
+  } catch (e) {
+    console.error('Erro ao enviar:', e);
+    res.status(500).json({ sucesso: false, erro: 'Falha ao enviar mensagem' });
+  }
+});
+
+app.get('/respostas', (req, res) => {
+  if (!autenticar(req, res)) return;
+  limparRespostasAntigas();
+  const paraEnviar = respostasPendentes;
+  respostasPendentes = [];
+  res.json({ respostas: paraEnviar });
+});
+
+const PORTA = process.env.PORT || 3000;
+app.listen(PORTA, () => console.log(`Servidor MaisBela na porta ${PORTA}`));
