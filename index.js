@@ -249,8 +249,17 @@ app.get('/status', (req, res) => {
 
 // ---------- Rotas autenticadas ----------
 
+/**
+ * Aceita a chave secreta de duas formas:
+ *  - Cabeçalho "x-chave-secreta" (usado pelo aplicativo Android).
+ *  - Parâmetro na URL "?chave=..." (usado pelo navegador, para emergências).
+ * Qualquer um dos dois vale.
+ */
 function autenticar(req, res) {
-  if (req.headers['x-chave-secreta'] !== CHAVE_SECRETA) {
+  const chaveHeader = req.headers['x-chave-secreta'];
+  const chaveQuery = req.query.chave;
+  const chaveRecebida = chaveHeader || chaveQuery;
+  if (chaveRecebida !== CHAVE_SECRETA) {
     res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
     return false;
   }
