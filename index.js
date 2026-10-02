@@ -1,19 +1,22 @@
 // Servidor do MaisBela — envia mensagens e escuta CONFIRMAR/CANCELAR.
 const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const qrcode = require('qrcode');
 const P = require('pino');
 
-// Capturar erros não tratados para evitar a queda do servidor no arranque
+// Ignorar exceções globais para evitar que o Node encerre o processo
 process.on('uncaughtException', (err) => {
-  console.error('❌ Erro não tratado (uncaughtException):', err);
+  if (err.message && err.message.includes('Bad MAC')) return;
+  console.error('⚠️ Exceção capturada:', err.message || err);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Rejeição não tratada (unhandledRejection):', reason);
+process.on('unhandledRejection', (reason) => {
+  if (reason && reason.toString().includes('Bad MAC')) return;
+  console.error('⚠️ Rejeição capturada:', reason);
 });
 
-// Importação segura do Baileys para CommonJS
+// Importação flexível do Baileys
 const Baileys = require('@whiskeysockets/baileys');
 const makeWASocket = Baileys.default || Baileys;
 const {
@@ -26,7 +29,7 @@ const app = express();
 app.use(express.json());
 
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
-const PASTA_SESSAO = 'auth_info';
+const PASTA_SESSAO = path.join(__dirname, 'auth_info');
 const TTL_RESPOSTA_MS = 1000 * 60 * 60 * 12;
 const MAX_RESPOSTAS = 500;
 
@@ -70,11 +73,19 @@ function limparRespostasAntigas() {
     .slice(-MAX_RESPOSTAS);
 }
 
-async function iniciarConexaoWhatsApp() {
-  if (conectando) {
-    console.log('Já existe uma conexão em andamento — ignorando chamada duplicada.');
-    return;
+function apagarSessaoLocal() {
+  try {
+    if (fs.existsSync(PASTA_SESSAO)) {
+      fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
+      console.log('🗑️ Pasta auth_info removida com sucesso.');
+    }
+  } catch (err) {
+    console.error('Erro ao remover pasta de sessão:', err);
   }
+}
+
+async function iniciarConexaoWhatsApp() {
+  if (conectando) return;
   conectando = true;
 
   try {
@@ -82,12 +93,9 @@ async function iniciarConexaoWhatsApp() {
     
     let version;
     try {
-      const versionInfo = await fetchLatestBaileysVersion();
-      version = versionInfo.version;
-      console.log('Usando versão do WhatsApp Web:', version);
-    } catch (errVer) {
-      console.warn('Falha ao obter última versão do WhatsApp Web, usando padrão:', errVer.message);
-    }
+      const v = await fetchLatestBaileysVersion();
+      version = v.version;
+    } catch (_) {}
 
     socketWhatsApp = makeWASocket({
       ...(version ? { version } : {}),
@@ -104,12 +112,9 @@ async function iniciarConexaoWhatsApp() {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (!msg.message) continue;
-        if (msg.key.fromMe) continue;
+        if (!msg.message || msg.key.fromMe) continue;
         const jid = msg.key.remoteJid || '';
-        if (jid.endsWith('@g.us')) continue;
-        if (jid === 'status@broadcast') continue;
-        if (jid.endsWith('@broadcast')) continue;
+        if (jid.endsWith('@g.us') || jid.includes('broadcast')) continue;
 
         const textoRecebido =
           msg.message.conversation ||
@@ -126,7 +131,7 @@ async function iniciarConexaoWhatsApp() {
         const telefone = jid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
         if (!telefone) continue;
 
-        console.log(`Resposta de ${telefone}: ${acao.toUpperCase()}`);
+        console.log(`💬 Resposta recebida de ${telefone}: ${acao.toUpperCase()}`);
         respostasPendentes.push({ telefone, acao, timestamp: Date.now() });
         limparRespostasAntigas();
       }
@@ -138,14 +143,14 @@ async function iniciarConexaoWhatsApp() {
       if (qr) {
         ultimoQrCodeBase64 = await qrcode.toDataURL(qr);
         statusConexao = 'aguardando_qr';
-        console.log('Novo QR gerado — acesse /qr (expira em ~60s).');
+        console.log('📱 Novo QR Code disponível em /qr');
       }
 
       if (connection === 'open') {
         statusConexao = 'conectado';
         ultimoQrCodeBase64 = null;
         conectando = false;
-        console.log('✅ Conectado ao WhatsApp!');
+        console.log('✅ Conectado ao WhatsApp com sucesso!');
       }
 
       if (connection === 'close') {
@@ -153,21 +158,16 @@ async function iniciarConexaoWhatsApp() {
         conectando = false;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const erroMensagem = lastDisconnect?.error?.message || '';
-        
         const foiLogout = statusCode === DisconnectReason.loggedOut;
-        const erroChaveOuMac = erroMensagem.includes('Bad MAC') || statusCode === 401;
 
-        console.log('Conexão fechada. Motivo:', statusCode, '| Erro:', erroMensagem);
+        console.log('🔴 Conexão encerrada. Código:', statusCode);
 
-        if (foiLogout || erroChaveOuMac) {
-          console.log('Sessão inválida ou corrompida — limpando sessão e gerando novo QR...');
-          try { fs.rmSync(PASTA_SESSAO, { recursive: true, force: true }); } catch (_) {}
+        if (foiLogout || statusCode === 401) {
+          console.log('Sessão expirada/inválida. Limpando credenciais...');
+          apagarSessaoLocal();
           statusConexao = 'iniciando';
           ultimoQrCodeBase64 = null;
           setTimeout(iniciarConexaoWhatsApp, 1000);
-        } else if (statusCode === DisconnectReason.restartRequired) {
-          iniciarConexaoWhatsApp();
         } else {
           setTimeout(iniciarConexaoWhatsApp, 3000);
         }
@@ -175,45 +175,41 @@ async function iniciarConexaoWhatsApp() {
     });
   } catch (e) {
     conectando = false;
-    console.error('Erro ao iniciar conexão com WhatsApp:', e);
+    console.error('Erro ao iniciar WhatsApp:', e);
   }
 }
 
-// Iniciar a conexão sem bloquear o arranque do Express
-iniciarConexaoWhatsApp().catch((err) => console.error('Erro ao chamar conexão:', err));
+iniciarConexaoWhatsApp().catch((err) => console.error(err));
 
-// ---------- Rotas públicas ----------
+// ---------- Rotas ----------
 
 app.get('/', (req, res) => {
-  res.send('Servidor MaisBela a rodar com sucesso!');
+  res.send('Servidor MaisBela a funcionar normalmente.');
 });
 
 app.get('/qr', (req, res) => {
-  if (statusConexao === 'conectado') return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
+  if (statusConexao === 'conectado') return res.send('<h2>✅ O WhatsApp já está conectado!</h2>');
   if (!ultimoQrCodeBase64) {
     return res.send(`<html><head><meta http-equiv="refresh" content="5"></head>
-      <body style="text-align:center;font-family:sans-serif;">
-      <h2>Gerando QR code... atualiza em 5s.</h2></body></html>`);
+      <body style="text-align:center;font-family:sans-serif;padding-top:50px;">
+      <h2>A gerar QR Code... A página atualiza em 5 segundos.</h2></body></html>`);
   }
   res.send(`<html><head><meta http-equiv="refresh" content="15"></head>
-    <body style="text-align:center;font-family:sans-serif;">
-    <h2>Escaneie com o WhatsApp do salão</h2>
+    <body style="text-align:center;font-family:sans-serif;padding-top:30px;">
+    <h2>Escaneie com o WhatsApp do Salão</h2>
     <p>WhatsApp > Aparelhos conectados > Conectar um aparelho</p>
-    <img src="${ultimoQrCodeBase64}" style="width:300px;" />
-    <p style="color:#888;">Atualiza sozinho a cada 15s.</p></body></html>`);
+    <img src="${ultimoQrCodeBase64}" style="width:280px;" />
+    <p style="color:#666;">Atualiza automaticamente a cada 15s.</p></body></html>`);
 });
 
 app.get('/status', (req, res) => {
   res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
 
-// ---------- Rotas autenticadas ----------
-
 function autenticar(req, res) {
   const chaveHeader = req.headers['x-chave-secreta'];
   const chaveQuery = req.query.chave;
-  const chaveRecebida = chaveHeader || chaveQuery;
-  if (chaveRecebida !== CHAVE_SECRETA) {
+  if ((chaveHeader || chaveQuery) !== CHAVE_SECRETA) {
     res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
     return false;
   }
@@ -222,12 +218,13 @@ function autenticar(req, res) {
 
 app.get('/reconectar', async (req, res) => {
   if (!autenticar(req, res)) return;
-  try { fs.rmSync(PASTA_SESSAO, { recursive: true, force: true }); } catch (_) {}
+  apagarSessaoLocal();
   statusConexao = 'iniciando';
   ultimoQrCodeBase64 = null;
   conectando = false;
+  if (socketWhatsApp) try { socketWhatsApp.end(); } catch (_) {}
   iniciarConexaoWhatsApp().catch((err) => console.error(err));
-  res.send('<h2>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
+  res.send('<h2>A reiniciar sessão... Aceda a /qr em alguns segundos.</h2>');
 });
 
 app.post('/enviar', async (req, res) => {
@@ -244,7 +241,7 @@ app.post('/enviar', async (req, res) => {
     await socketWhatsApp.sendMessage(numero, { text: mensagem });
     res.json({ sucesso: true });
   } catch (e) {
-    console.error('Erro ao enviar:', e);
+    console.error('Erro ao enviar mensagem:', e);
     res.status(500).json({ sucesso: false, erro: 'Falha ao enviar mensagem' });
   }
 });
