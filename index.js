@@ -15,16 +15,76 @@ app.use(express.json());
 
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
 const PASTA_SESSAO = 'auth_info';
-const TTL_RESPOSTA_MS = 1000 * 60 * 60 * 12; // descarta respostas com +12h
+const TTL_RESPOSTA_MS = 1000 * 60 * 60 * 12;
 const MAX_RESPOSTAS = 500;
 
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
 let statusConexao = 'iniciando';
 let ultimoMotivoDesconexao = '';
-let conectando = false; // trava contra reconexões duplicadas
-
+let conectando = false;
 let respostasPendentes = [];
+
+// Contador de erros "Bad MAC" consecutivos. Se passar do limite,
+// significa que a sessão corrompeu — limpamos e geramos QR novo sozinhos.
+let badMacSeguidos = 0;
+let limpandoSessao = false;
+let timerZerarBadMac = null;
+
+/** Cria um logger que conta os "Bad MAC" e deixa os outros logs passarem. */
+function criarLoggerComContadorBadMac() {
+  const loggerBase = P({ level: 'error' });
+
+  const contarBadMac = () => {
+    badMacSeguidos++;
+    clearTimeout(timerZerarBadMac);
+    timerZerarBadMac = setTimeout(() => { badMacSeguidos = 0; }, 5 * 60 * 1000);
+
+    if (badMacSeguidos >= 10) {
+      tratarBadMac();
+    }
+  };
+
+  return {
+    level: 'error',
+    fatal: (obj, msg, ...args) => {
+      if (String(msg || '').includes('Bad MAC') || String(obj?.err?.message || '').includes('Bad MAC')) {
+        contarBadMac();
+      }
+      loggerBase.fatal(obj, msg, ...args);
+    },
+    error: (obj, msg, ...args) => {
+      const texto = String(msg || '') + ' ' + String(obj?.err?.message || '');
+      if (texto.includes('Bad MAC')) {
+        contarBadMac();
+      }
+      loggerBase.error(obj, msg, ...args);
+    },
+    warn: () => {},
+    info: () => {},
+    debug: () => {},
+    trace: () => {},
+    child: () => criarLoggerComContadorBadMac()
+  };
+}
+
+/** Limpa a sessão corrompida e reinicia para gerar QR novo. */
+async function tratarBadMac() {
+  if (limpandoSessao) return;
+  limpandoSessao = true;
+  badMacSeguidos = 0;
+  console.log('⚠️ Sessão corrompida (Bad MAC repetido). Limpando e gerando QR novo...');
+
+  try { fs.rmSync(PASTA_SESSAO, { recursive: true, force: true }); } catch (_) {}
+  statusConexao = 'iniciando';
+  ultimoQrCodeBase64 = null;
+
+  try { socketWhatsApp?.ws?.close(); } catch (_) {}
+  try { socketWhatsApp?.end?.(new Error('bad-mac-recovery')); } catch (_) {}
+
+  conectando = false;
+  setTimeout(() => { limpandoSessao = false; iniciarConexaoWhatsApp(); }, 2000);
+}
 
 function normalizarTexto(texto) {
   return texto
@@ -34,26 +94,18 @@ function normalizarTexto(texto) {
     .trim();
 }
 
-/**
- * Detecta intenção de confirmar/cancelar apenas quando a mensagem é
- * essencialmente isso. Evita casar com "não vou confirmar", "já confirmei" etc.
- */
 function detectarAcao(textoOriginal) {
   const t = normalizarTexto(textoOriginal);
-  // Pega a primeira palavra significativa (ignora emojis/pontuação).
   const primeira = (t.match(/[A-Z]+/) || [''])[0];
-
   const negativos = ['NAO', 'NUNCA', 'JAMAIS', 'DEPOIS', 'AMANHA', 'TALVEZ'];
 
   if (primeira.startsWith('CONFIRMAR') || primeira === 'CONFIRMO' || primeira === 'SIM') {
-    // Se a frase contém negação logo antes, descarta.
     const idx = t.indexOf(primeira);
     const antes = t.slice(Math.max(0, idx - 10), idx);
     if (negativos.some((n) => antes.includes(n))) return null;
     return 'confirmar';
   }
   if (primeira.startsWith('CANCELAR') || primeira === 'CANCELO' || primeira === 'NAO') {
-    // "NÃO" só conta como cancelar se for a primeira palavra.
     if (primeira === 'NAO' && !t.startsWith('NAO')) return null;
     return 'cancelar';
   }
@@ -82,23 +134,31 @@ async function iniciarConexaoWhatsApp() {
     socketWhatsApp = makeWASocket({
       version,
       auth: state,
-      logger: P({ level: 'silent' }),
+      logger: criarLoggerComContadorBadMac(),
       printQRInTerminal: false,
-      browser: ['MaisBela', 'Chrome', '1.0.0']
+      browser: ['MaisBela', 'Chrome', '1.0.0'],
+      // Reduz a chance de o Baileys acumular chaves antigas e corromper a sessão.
+      getMessage: async () => undefined,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false
     });
 
     socketWhatsApp.ev.on('creds.update', saveCreds);
 
     socketWhatsApp.ev.on('messages.upsert', ({ messages, type }) => {
-      if (type !== 'notify') return; // ignora histórico/sincronização
+      // Qualquer mensagem recebida com sucesso significa que a sessão está OK.
+      badMacSeguidos = 0;
+
+      if (type !== 'notify') return;
 
       for (const msg of messages) {
         if (!msg.message) continue;
         if (msg.key.fromMe) continue;
         const jid = msg.key.remoteJid || '';
-        if (jid.endsWith('@g.us')) continue;        // grupos
-        if (jid === 'status@broadcast') continue;   // status
-        if (jid.endsWith('@broadcast')) continue;   // listas
+        if (jid.endsWith('@g.us')) continue;
+        if (jid === 'status@broadcast') continue;
+        if (jid.endsWith('@broadcast')) continue;
 
         const textoRecebido =
           msg.message.conversation ||
@@ -134,6 +194,7 @@ async function iniciarConexaoWhatsApp() {
         statusConexao = 'conectado';
         ultimoQrCodeBase64 = null;
         conectando = false;
+        badMacSeguidos = 0;
         console.log('✅ Conectado ao WhatsApp!');
       }
 
@@ -144,7 +205,7 @@ async function iniciarConexaoWhatsApp() {
         const foiLogout = motivo === DisconnectReason.loggedOut;
         console.log('Conexão fechada. Motivo:', motivo, '| Logout:', foiLogout);
 
-        conectando = false; // libera trava para reconectar
+        conectando = false;
 
         if (foiLogout) {
           console.log('Logout detectado — limpando sessão e gerando novo QR...');
@@ -153,7 +214,7 @@ async function iniciarConexaoWhatsApp() {
           ultimoQrCodeBase64 = null;
           setTimeout(iniciarConexaoWhatsApp, 1000);
         } else {
-          setTimeout(iniciarConexaoWhatsApp, 3000); // backoff curto
+          setTimeout(iniciarConexaoWhatsApp, 3000);
         }
       }
     });
@@ -183,7 +244,7 @@ app.get('/qr', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ status: statusConexao, ultimoMotivoDesconexao });
+  res.json({ status: statusConexao, ultimoMotivoDesconexao, badMacSeguidos });
 });
 
 // ---------- Rotas autenticadas ----------
@@ -202,6 +263,7 @@ app.get('/reconectar', async (req, res) => {
   statusConexao = 'iniciando';
   ultimoQrCodeBase64 = null;
   conectando = false;
+  badMacSeguidos = 0;
   await iniciarConexaoWhatsApp();
   res.send('<h2>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
 });
