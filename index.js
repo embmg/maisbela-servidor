@@ -25,50 +25,20 @@ let ultimoMotivoDesconexao = '';
 let conectando = false;
 let respostasPendentes = [];
 
-// Contador de erros "Bad MAC" consecutivos. Se passar do limite,
-// significa que a sessão corrompeu — limpamos e geramos QR novo sozinhos.
 let badMacSeguidos = 0;
 let limpandoSessao = false;
 let timerZerarBadMac = null;
 
-/** Cria um logger que conta os "Bad MAC" e deixa os outros logs passarem. */
-function criarLoggerComContadorBadMac() {
-  const loggerBase = P({ level: 'error' });
+function contarBadMac() {
+  badMacSeguidos++;
+  clearTimeout(timerZerarBadMac);
+  timerZerarBadMac = setTimeout(() => { badMacSeguidos = 0; }, 60 * 1000);
 
-  const contarBadMac = () => {
-    badMacSeguidos++;
-    clearTimeout(timerZerarBadMac);
-    timerZerarBadMac = setTimeout(() => { badMacSeguidos = 0; }, 5 * 60 * 1000);
-
-    if (badMacSeguidos >= 10) {
-      tratarBadMac();
-    }
-  };
-
-  return {
-    level: 'error',
-    fatal: (obj, msg, ...args) => {
-      if (String(msg || '').includes('Bad MAC') || String(obj?.err?.message || '').includes('Bad MAC')) {
-        contarBadMac();
-      }
-      loggerBase.fatal(obj, msg, ...args);
-    },
-    error: (obj, msg, ...args) => {
-      const texto = String(msg || '') + ' ' + String(obj?.err?.message || '');
-      if (texto.includes('Bad MAC')) {
-        contarBadMac();
-      }
-      loggerBase.error(obj, msg, ...args);
-    },
-    warn: () => {},
-    info: () => {},
-    debug: () => {},
-    trace: () => {},
-    child: () => criarLoggerComContadorBadMac()
-  };
+  if (badMacSeguidos >= 20) {
+    tratarBadMac();
+  }
 }
 
-/** Limpa a sessão corrompida e reinicia para gerar QR novo. */
 async function tratarBadMac() {
   if (limpandoSessao) return;
   limpandoSessao = true;
@@ -84,6 +54,49 @@ async function tratarBadMac() {
 
   conectando = false;
   setTimeout(() => { limpandoSessao = false; iniciarConexaoWhatsApp(); }, 2000);
+}
+
+/** Verifica se o texto recebido é um erro de sessão (Bad MAC, no matching sessions). */
+function ehErroDeSessao(...partes) {
+  const texto = partes.map((p) => {
+    if (p == null) return '';
+    if (typeof p === 'string') return p;
+    if (typeof p === 'object') {
+      return String(p.message || '') + ' ' + String(p.err?.message || '') + ' ' + String(p.stack || '');
+    }
+    return String(p);
+  }).join(' ');
+  return texto.includes('Bad MAC') || texto.includes('No matching sessions');
+}
+
+// Intercepta o console.error diretamente, porque o Baileys usa essa via
+// para logar os Bad MAC em alguns casos (não passa pelo logger pino).
+const consoleErrorOriginal = console.error.bind(console);
+console.error = (...args) => {
+  if (ehErroDeSessao(...args)) {
+    contarBadMac();
+  }
+  consoleErrorOriginal(...args);
+};
+
+function criarLoggerComContadorBadMac() {
+  const loggerBase = P({ level: 'error' });
+  return {
+    level: 'error',
+    fatal: (...args) => {
+      if (ehErroDeSessao(...args)) contarBadMac();
+      loggerBase.fatal(...args);
+    },
+    error: (...args) => {
+      if (ehErroDeSessao(...args)) contarBadMac();
+      loggerBase.error(...args);
+    },
+    warn: () => {},
+    info: () => {},
+    debug: () => {},
+    trace: () => {},
+    child: () => criarLoggerComContadorBadMac()
+  };
 }
 
 function normalizarTexto(texto) {
@@ -137,7 +150,6 @@ async function iniciarConexaoWhatsApp() {
       logger: criarLoggerComContadorBadMac(),
       printQRInTerminal: false,
       browser: ['MaisBela', 'Chrome', '1.0.0'],
-      // Reduz a chance de o Baileys acumular chaves antigas e corromper a sessão.
       getMessage: async () => undefined,
       syncFullHistory: false,
       markOnlineOnConnect: false,
@@ -147,7 +159,6 @@ async function iniciarConexaoWhatsApp() {
     socketWhatsApp.ev.on('creds.update', saveCreds);
 
     socketWhatsApp.ev.on('messages.upsert', ({ messages, type }) => {
-      // Qualquer mensagem recebida com sucesso significa que a sessão está OK.
       badMacSeguidos = 0;
 
       if (type !== 'notify') return;
@@ -249,12 +260,6 @@ app.get('/status', (req, res) => {
 
 // ---------- Rotas autenticadas ----------
 
-/**
- * Aceita a chave secreta de duas formas:
- *  - Cabeçalho "x-chave-secreta" (usado pelo aplicativo Android).
- *  - Parâmetro na URL "?chave=..." (usado pelo navegador, para emergências).
- * Qualquer um dos dois vale.
- */
 function autenticar(req, res) {
   const chaveHeader = req.headers['x-chave-secreta'];
   const chaveQuery = req.query.chave;
