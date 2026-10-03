@@ -1,43 +1,29 @@
-// Servidor do MaisBela — envia mensagens e escuta CONFIRMAR/CANCELAR.
+// Servidor do MaisBela: mantém uma conexão com o WhatsApp, envia mensagens
+// automaticamente, e "escuta" as respostas das clientes para confirmar ou
+// cancelar agendamentos sozinho.
+
 const fs = require('fs');
-const path = require('path');
 const express = require('express');
 const qrcode = require('qrcode');
 const P = require('pino');
-
-// Ignorar exceções globais para evitar que o Node encerre o processo
-process.on('uncaughtException', (err) => {
-  if (err.message && err.message.includes('Bad MAC')) return;
-  console.error('⚠️ Exceção capturada:', err.message || err);
-});
-
-process.on('unhandledRejection', (reason) => {
-  if (reason && reason.toString().includes('Bad MAC')) return;
-  console.error('⚠️ Rejeição capturada:', reason);
-});
-
-// Importação flexível do Baileys
-const Baileys = require('@whiskeysockets/baileys');
-const makeWASocket = Baileys.default || Baileys;
 const {
+  default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion
-} = Baileys;
+} = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(express.json());
 
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
-const PASTA_SESSAO = path.join(__dirname, 'auth_info');
-const TTL_RESPOSTA_MS = 1000 * 60 * 60 * 12;
-const MAX_RESPOSTAS = 500;
+const PASTA_SESSAO = 'auth_info';
 
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
-let statusConexao = 'iniciando';
+let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desconectado
 let ultimoMotivoDesconexao = '';
-let conectando = false;
+
 let respostasPendentes = [];
 
 function normalizarTexto(texto) {
@@ -48,213 +34,175 @@ function normalizarTexto(texto) {
     .trim();
 }
 
-function detectarAcao(textoOriginal) {
-  const t = normalizarTexto(textoOriginal);
-  const primeira = (t.match(/[A-Z]+/) || [''])[0];
-  const negativos = ['NAO', 'NUNCA', 'JAMAIS', 'DEPOIS', 'AMANHA', 'TALVEZ'];
-
-  if (primeira.startsWith('CONFIRMAR') || primeira === 'CONFIRMO' || primeira === 'SIM') {
-    const idx = t.indexOf(primeira);
-    const antes = t.slice(Math.max(0, idx - 10), idx);
-    if (negativos.some((n) => antes.includes(n))) return null;
-    return 'confirmar';
-  }
-  if (primeira.startsWith('CANCELAR') || primeira === 'CANCELO' || primeira === 'NAO') {
-    if (primeira === 'NAO' && !t.startsWith('NAO')) return null;
-    return 'cancelar';
-  }
-  return null;
-}
-
-function limparRespostasAntigas() {
-  const agora = Date.now();
-  respostasPendentes = respostasPendentes
-    .filter((r) => agora - r.timestamp < TTL_RESPOSTA_MS)
-    .slice(-MAX_RESPOSTAS);
-}
-
-function apagarSessaoLocal() {
-  try {
-    if (fs.existsSync(PASTA_SESSAO)) {
-      fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
-      console.log('🗑️ Pasta auth_info removida com sucesso.');
-    }
-  } catch (err) {
-    console.error('Erro ao remover pasta de sessão:', err);
-  }
-}
-
 async function iniciarConexaoWhatsApp() {
-  if (conectando) return;
-  conectando = true;
+  const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
 
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
-    
-    let version;
-    try {
-      const v = await fetchLatestBaileysVersion();
-      version = v.version;
-    } catch (_) {}
+  const { version } = await fetchLatestBaileysVersion();
+  console.log('Usando versão do WhatsApp Web:', version);
 
-    socketWhatsApp = makeWASocket({
-      ...(version ? { version } : {}),
-      auth: state,
-      logger: P({ level: 'silent' }),
-      printQRInTerminal: false,
-      browser: ['MaisBela', 'Chrome', '1.0.0'],
-      getMessage: async () => ({ conversation: '' })
-    });
+  socketWhatsApp = makeWASocket({
+    version,
+    auth: state,
+    logger: P({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: ['MaisBela', 'Chrome', '1.0.0'],
+    // Desliga a sincronização do histórico completo de conversas — não
+    // precisamos dele, e ele sobrecarrega o pouco recurso que o plano
+    // gratuito da Render oferece, o que estava corrompendo a sessão
+    // (causa raiz dos erros "Bad MAC" em loop).
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false
+  });
 
-    socketWhatsApp.ev.on('creds.update', saveCreds);
+  socketWhatsApp.ev.on('creds.update', saveCreds);
 
-    socketWhatsApp.ev.on('messages.upsert', ({ messages, type }) => {
-      if (type !== 'notify') return;
+  socketWhatsApp.ev.on('messages.upsert', (evento) => {
+    for (const msg of evento.messages) {
+      if (msg.key.fromMe) continue;
+      if (msg.key.remoteJid?.endsWith('@g.us')) continue;
 
-      for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe) continue;
-        const jid = msg.key.remoteJid || '';
-        if (jid.endsWith('@g.us') || jid.includes('broadcast')) continue;
+      const textoRecebido =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        '';
 
-        const textoRecebido =
-          msg.message.conversation ||
-          msg.message.extendedTextMessage?.text ||
-          msg.message.buttonsResponseMessage?.selectedButtonId ||
-          msg.message.listResponseMessage?.singleSelectReply?.selectedRowId ||
-          '';
+      if (!textoRecebido) continue;
 
-        if (!textoRecebido) continue;
+      const textoNormalizado = normalizarTexto(textoRecebido);
+      const telefone = msg.key.remoteJid.replace('@s.whatsapp.net', '');
 
-        const acao = detectarAcao(textoRecebido);
-        if (!acao) continue;
+      let acao = null;
+      if (textoNormalizado.includes('CONFIRMAR')) acao = 'confirmar';
+      else if (textoNormalizado.includes('CANCELAR')) acao = 'cancelar';
 
-        const telefone = jid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
-        if (!telefone) continue;
-
+      if (acao) {
         console.log(`💬 Resposta recebida de ${telefone}: ${acao.toUpperCase()}`);
         respostasPendentes.push({ telefone, acao, timestamp: Date.now() });
-        limparRespostasAntigas();
       }
-    });
+    }
+  });
 
-    socketWhatsApp.ev.on('connection.update', async (atualizacao) => {
-      const { connection, lastDisconnect, qr } = atualizacao;
+  socketWhatsApp.ev.on('connection.update', async (atualizacao) => {
+    const { connection, lastDisconnect, qr } = atualizacao;
 
-      if (qr) {
-        ultimoQrCodeBase64 = await qrcode.toDataURL(qr);
-        statusConexao = 'aguardando_qr';
-        console.log('📱 Novo QR Code disponível em /qr');
-      }
+    if (qr) {
+      ultimoQrCodeBase64 = await qrcode.toDataURL(qr);
+      statusConexao = 'aguardando_qr';
+      console.log('📱 Novo QR Code disponível em /qr');
+    }
 
-      if (connection === 'open') {
-        statusConexao = 'conectado';
-        ultimoQrCodeBase64 = null;
-        conectando = false;
-        console.log('✅ Conectado ao WhatsApp com sucesso!');
-      }
+    if (connection === 'open') {
+      statusConexao = 'conectado';
+      ultimoQrCodeBase64 = null;
+      console.log('✅ Conectado ao WhatsApp com sucesso!');
+    }
 
-      if (connection === 'close') {
-        statusConexao = 'desconectado';
-        conectando = false;
+    if (connection === 'close') {
+      statusConexao = 'desconectado';
+      const motivo = lastDisconnect?.error?.output?.statusCode;
+      ultimoMotivoDesconexao = String(motivo || 'desconhecido');
+      const foiLogout = motivo === DisconnectReason.loggedOut;
 
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const foiLogout = statusCode === DisconnectReason.loggedOut;
+      console.log('🔴 Conexão encerrada. Código:', motivo);
 
-        console.log('🔴 Conexão encerrada. Código:', statusCode);
-
-        if (foiLogout || statusCode === 401) {
-          console.log('Sessão expirada/inválida. Limpando credenciais...');
-          apagarSessaoLocal();
-          statusConexao = 'iniciando';
-          ultimoQrCodeBase64 = null;
-          setTimeout(iniciarConexaoWhatsApp, 1000);
-        } else {
-          setTimeout(iniciarConexaoWhatsApp, 3000);
+      if (foiLogout) {
+        console.log('Logout detectado — limpando sessão antiga e gerando novo QR code...');
+        try {
+          fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
+        } catch (e) {
+          console.error('Erro ao limpar pasta de sessão:', e);
         }
+        statusConexao = 'iniciando';
+        ultimoQrCodeBase64 = null;
+        iniciarConexaoWhatsApp();
+      } else {
+        iniciarConexaoWhatsApp();
       }
-    });
-  } catch (e) {
-    conectando = false;
-    console.error('Erro ao iniciar WhatsApp:', e);
-  }
+    }
+  });
 }
 
-iniciarConexaoWhatsApp().catch((err) => console.error(err));
-
-// ---------- Rotas ----------
-
-app.get('/', (req, res) => {
-  res.send('Servidor MaisBela a funcionar normalmente.');
-});
+iniciarConexaoWhatsApp();
 
 app.get('/qr', (req, res) => {
-  if (statusConexao === 'conectado') return res.send('<h2>✅ O WhatsApp já está conectado!</h2>');
-  if (!ultimoQrCodeBase64) {
-    return res.send(`<html><head><meta http-equiv="refresh" content="5"></head>
-      <body style="text-align:center;font-family:sans-serif;padding-top:50px;">
-      <h2>A gerar QR Code... A página atualiza em 5 segundos.</h2></body></html>`);
+  if (statusConexao === 'conectado') {
+    return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
   }
-  res.send(`<html><head><meta http-equiv="refresh" content="15"></head>
-    <body style="text-align:center;font-family:sans-serif;padding-top:30px;">
-    <h2>Escaneie com o WhatsApp do Salão</h2>
-    <p>WhatsApp > Aparelhos conectados > Conectar um aparelho</p>
-    <img src="${ultimoQrCodeBase64}" style="width:280px;" />
-    <p style="color:#666;">Atualiza automaticamente a cada 15s.</p></body></html>`);
+  if (!ultimoQrCodeBase64) {
+    return res.send(`
+      <html>
+        <head><meta http-equiv="refresh" content="5"></head>
+        <body style="text-align:center; font-family: sans-serif;">
+          <h2>Gerando QR code... esta página atualiza sozinha em 5 segundos.</h2>
+        </body>
+      </html>
+    `);
+  }
+  res.send(`
+    <html>
+      <head><meta http-equiv="refresh" content="15"></head>
+      <body style="text-align:center; font-family: sans-serif;">
+        <h2>Escaneie este código com o WhatsApp do salão</h2>
+        <p>WhatsApp > Aparelhos conectados > Conectar um aparelho</p>
+        <img src="${ultimoQrCodeBase64}" style="width:300px;" />
+        <p style="color:#888;">Esta página atualiza sozinha a cada 15 segundos com um QR novo, se precisar.</p>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/reconectar', async (req, res) => {
+  try {
+    fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
+  } catch (e) {}
+  statusConexao = 'iniciando';
+  ultimoQrCodeBase64 = null;
+  await iniciarConexaoWhatsApp();
+  res.send('<h2>🗑️ Pasta auth_info removida com sucesso.<br>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
+});
+
+app.post('/enviar', async (req, res) => {
+  const chaveRecebida = req.headers['x-chave-secreta'];
+  if (chaveRecebida !== CHAVE_SECRETA) {
+    return res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
+  }
+
+  if (statusConexao !== 'conectado') {
+    return res.status(503).json({ sucesso: false, erro: 'WhatsApp não está conectado no momento' });
+  }
+
+  const { telefone, mensagem } = req.body;
+  if (!telefone || !mensagem) {
+    return res.status(400).json({ sucesso: false, erro: 'Envie telefone e mensagem' });
+  }
+
+  try {
+    const numeroFormatado = telefone.replace(/\D/g, '') + '@s.whatsapp.net';
+    await socketWhatsApp.sendMessage(numeroFormatado, { text: mensagem });
+    res.json({ sucesso: true });
+  } catch (erro) {
+    console.error('Erro ao enviar mensagem:', erro);
+    res.status(500).json({ sucesso: false, erro: 'Falha ao enviar mensagem' });
+  }
+});
+
+app.get('/respostas', (req, res) => {
+  const chaveRecebida = req.headers['x-chave-secreta'];
+  if (chaveRecebida !== CHAVE_SECRETA) {
+    return res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
+  }
+
+  const respostasParaEnviar = respostasPendentes;
+  respostasPendentes = [];
+  res.json({ respostas: respostasParaEnviar });
 });
 
 app.get('/status', (req, res) => {
   res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
 
-function autenticar(req, res) {
-  const chaveHeader = req.headers['x-chave-secreta'];
-  const chaveQuery = req.query.chave;
-  if ((chaveHeader || chaveQuery) !== CHAVE_SECRETA) {
-    res.status(401).json({ sucesso: false, erro: 'Chave secreta inválida' });
-    return false;
-  }
-  return true;
-}
-
-app.get('/reconectar', async (req, res) => {
-  if (!autenticar(req, res)) return;
-  apagarSessaoLocal();
-  statusConexao = 'iniciando';
-  ultimoQrCodeBase64 = null;
-  conectando = false;
-  if (socketWhatsApp) try { socketWhatsApp.end(); } catch (_) {}
-  iniciarConexaoWhatsApp().catch((err) => console.error(err));
-  res.send('<h2>A reiniciar sessão... Aceda a /qr em alguns segundos.</h2>');
-});
-
-app.post('/enviar', async (req, res) => {
-  if (!autenticar(req, res)) return;
-  if (statusConexao !== 'conectado') {
-    return res.status(503).json({ sucesso: false, erro: 'WhatsApp não conectado' });
-  }
-  const { telefone, mensagem } = req.body;
-  if (!telefone || !mensagem) {
-    return res.status(400).json({ sucesso: false, erro: 'Envie telefone e mensagem' });
-  }
-  try {
-    const numero = telefone.replace(/\D/g, '') + '@s.whatsapp.net';
-    await socketWhatsApp.sendMessage(numero, { text: mensagem });
-    res.json({ sucesso: true });
-  } catch (e) {
-    console.error('Erro ao enviar mensagem:', e);
-    res.status(500).json({ sucesso: false, erro: 'Falha ao enviar mensagem' });
-  }
-});
-
-app.get('/respostas', (req, res) => {
-  if (!autenticar(req, res)) return;
-  limparRespostasAntigas();
-  const paraEnviar = respostasPendentes;
-  respostasPendentes = [];
-  res.json({ respostas: paraEnviar });
-});
-
 const PORTA = process.env.PORT || 3000;
-app.listen(PORTA, '0.0.0.0', () => {
-  console.log(`Servidor MaisBela a rodar na porta ${PORTA}`);
+app.listen(PORTA, () => {
+  console.log(`Servidor do MaisBela rodando na porta ${PORTA}`);
 });
