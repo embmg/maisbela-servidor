@@ -21,8 +21,9 @@ const PASTA_SESSAO = 'auth_info';
 
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
-let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desconectado
+let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desconectado | substituido
 let ultimoMotivoDesconexao = '';
+let tentandoReconectar = false;
 
 let respostasPendentes = [];
 
@@ -46,10 +47,6 @@ async function iniciarConexaoWhatsApp() {
     logger: P({ level: 'silent' }),
     printQRInTerminal: false,
     browser: ['MaisBela', 'Chrome', '1.0.0'],
-    // Desliga a sincronização do histórico completo de conversas — não
-    // precisamos dele, e ele sobrecarrega o pouco recurso que o plano
-    // gratuito da Render oferece, o que estava corrompendo a sessão
-    // (causa raiz dos erros "Bad MAC" em loop).
     syncFullHistory: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false
@@ -95,18 +92,16 @@ async function iniciarConexaoWhatsApp() {
     if (connection === 'open') {
       statusConexao = 'conectado';
       ultimoQrCodeBase64 = null;
+      tentandoReconectar = false;
       console.log('✅ Conectado ao WhatsApp com sucesso!');
     }
 
     if (connection === 'close') {
-      statusConexao = 'desconectado';
       const motivo = lastDisconnect?.error?.output?.statusCode;
       ultimoMotivoDesconexao = String(motivo || 'desconhecido');
-      const foiLogout = motivo === DisconnectReason.loggedOut;
-
       console.log('🔴 Conexão encerrada. Código:', motivo);
 
-      if (foiLogout) {
+      if (motivo === DisconnectReason.loggedOut) {
         console.log('Logout detectado — limpando sessão antiga e gerando novo QR code...');
         try {
           fs.rmSync(PASTA_SESSAO, { recursive: true, force: true });
@@ -116,9 +111,29 @@ async function iniciarConexaoWhatsApp() {
         statusConexao = 'iniciando';
         ultimoQrCodeBase64 = null;
         iniciarConexaoWhatsApp();
-      } else {
-        iniciarConexaoWhatsApp();
+        return;
       }
+
+      if (motivo === DisconnectReason.connectionReplaced) {
+        // Outro aparelho/sessão assumiu essa mesma conexão — reconectar
+        // na hora só pioraria (loop infinito). Para aqui e espera uma
+        // ação manual: limpar os aparelhos vinculados no WhatsApp e
+        // acessar /reconectar.
+        console.log('⚠️ Conexão substituída por outro aparelho. Parando de tentar automaticamente.');
+        console.log('👉 Remova TODOS os aparelhos em WhatsApp > Aparelhos conectados, depois acesse /reconectar');
+        statusConexao = 'substituido';
+        return;
+      }
+
+      // Qualquer outro motivo: espera 5 segundos antes de tentar de novo,
+      // para nunca entrar num loop de reconexão instantânea.
+      if (tentandoReconectar) return;
+      tentandoReconectar = true;
+      statusConexao = 'desconectado';
+      setTimeout(() => {
+        tentandoReconectar = false;
+        iniciarConexaoWhatsApp();
+      }, 5000);
     }
   });
 }
@@ -128,6 +143,14 @@ iniciarConexaoWhatsApp();
 app.get('/qr', (req, res) => {
   if (statusConexao === 'conectado') {
     return res.send('<h2>✅ Já está conectado ao WhatsApp!</h2>');
+  }
+  if (statusConexao === 'substituido') {
+    return res.send(`
+      <h2>⚠️ Conexão foi substituída por outro aparelho.</h2>
+      <p>1. Abra o WhatsApp do salão → Configurações → Aparelhos conectados</p>
+      <p>2. Remova TODOS os aparelhos listados</p>
+      <p>3. Acesse <a href="/reconectar">/reconectar</a></p>
+    `);
   }
   if (!ultimoQrCodeBase64) {
     return res.send(`
@@ -158,6 +181,7 @@ app.get('/reconectar', async (req, res) => {
   } catch (e) {}
   statusConexao = 'iniciando';
   ultimoQrCodeBase64 = null;
+  tentandoReconectar = false;
   await iniciarConexaoWhatsApp();
   res.send('<h2>🗑️ Pasta auth_info removida com sucesso.<br>Reiniciando conexão... acesse /qr em alguns segundos.</h2>');
 });
