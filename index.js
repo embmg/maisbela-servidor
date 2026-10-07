@@ -1,6 +1,6 @@
 // Servidor do MaisBela: mantém uma conexão com o WhatsApp, envia mensagens
-// automaticamente, e "escuta" as respostas das clientes para confirmar ou
-// cancelar agendamentos sozinho.
+// automaticamente, "escuta" as respostas das clientes e atualiza o Firebase
+// quando alguém clica nos links de confirmação/cancelamento.
 
 const fs = require('fs');
 const express = require('express');
@@ -19,9 +19,14 @@ app.use(express.json());
 const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
 const PASTA_SESSAO = 'auth_info';
 
+// ===================== CONFIGURAÇÃO FIREBASE =====================
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'espacomaisbelasalao';
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || 'AIzaSyBvMiIOorcHxZoKNmiGA2L7kTzx-oDexZA';
+// ================================================================
+
 let socketWhatsApp = null;
 let ultimoQrCodeBase64 = null;
-let statusConexao = 'iniciando'; // iniciando | aguardando_qr | conectado | desconectado | substituido
+let statusConexao = 'iniciando';
 let ultimoMotivoDesconexao = '';
 let tentandoReconectar = false;
 
@@ -34,6 +39,46 @@ function normalizarTexto(texto) {
     .toUpperCase()
     .trim();
 }
+
+// ===================== FUNÇÃO QUE ATUALIZA O FIREBASE =====================
+async function atualizarStatusNoFirebase(idAgendamento, novoStatus) {
+  if (!FIREBASE_API_KEY) {
+    console.error('⚠️ FIREBASE_API_KEY não configurada nas variáveis de ambiente.');
+    return false;
+  }
+
+  const url =
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}` +
+    `/databases/(default)/documents/agendamentos/${idAgendamento}` +
+    `?updateMask.fieldPaths=status&key=${FIREBASE_API_KEY}`;
+
+  const corpo = {
+    fields: {
+      status: { stringValue: novoStatus }
+    }
+  };
+
+  try {
+    const resposta = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(corpo)
+    });
+
+    if (!resposta.ok) {
+      const texto = await resposta.text();
+      console.error(`❌ Firebase respondeu ${resposta.status}: ${texto}`);
+      return false;
+    }
+
+    console.log(`✅ Firebase: agendamento ${idAgendamento} → "${novoStatus}"`);
+    return true;
+  } catch (erro) {
+    console.error('❌ Erro ao chamar Firebase:', erro);
+    return false;
+  }
+}
+// ==========================================================================
 
 async function iniciarConexaoWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
@@ -115,18 +160,12 @@ async function iniciarConexaoWhatsApp() {
       }
 
       if (motivo === DisconnectReason.connectionReplaced) {
-        // Outro aparelho/sessão assumiu essa mesma conexão — reconectar
-        // na hora só pioraria (loop infinito). Para aqui e espera uma
-        // ação manual: limpar os aparelhos vinculados no WhatsApp e
-        // acessar /reconectar.
         console.log('⚠️ Conexão substituída por outro aparelho. Parando de tentar automaticamente.');
         console.log('👉 Remova TODOS os aparelhos em WhatsApp > Aparelhos conectados, depois acesse /reconectar');
         statusConexao = 'substituido';
         return;
       }
 
-      // Qualquer outro motivo: espera 5 segundos antes de tentar de novo,
-      // para nunca entrar num loop de reconexão instantânea.
       if (tentandoReconectar) return;
       tentandoReconectar = true;
       statusConexao = 'desconectado';
@@ -225,6 +264,89 @@ app.get('/respostas', (req, res) => {
 app.get('/status', (req, res) => {
   res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
+
+// ============================================================
+// ROTAS DE CONFIRMAÇÃO E CANCELAMENTO (as páginas que a cliente vê)
+// ============================================================
+
+function paginaResposta(titulo, cor, emoji, mensagem) {
+  return `
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${titulo}</title>
+      </head>
+      <body style="margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #a78bcf 0%, #7c5cad 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center;">
+        <div style="background: white; padding: 40px 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); max-width: 380px; margin: 20px; text-align: center;">
+          <div style="font-size: 64px; margin-bottom: 10px;">${emoji}</div>
+          <h1 style="color: ${cor}; font-size: 24px; margin: 10px 0 20px 0;">${titulo}</h1>
+          <p style="color: #555; font-size: 16px; line-height: 1.5; margin: 0;">${mensagem}</p>
+          <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #999; font-size: 13px;">
+            Espaço Mais Bela 💅
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+app.get('/confirmar', async (req, res) => {
+  const id = req.query.id;
+  console.log(`👉 Cliente clicou em CONFIRMAR para o agendamento ${id}`);
+
+  if (!id) {
+    return res.status(400).send(paginaResposta('Link inválido', '#f44336', '⚠️', 'O link não contém um agendamento válido.'));
+  }
+
+  const sucesso = await atualizarStatusNoFirebase(id, 'Confirmado');
+
+  if (sucesso) {
+    return res.send(paginaResposta(
+      'Agendamento Confirmado!',
+      '#4CAF50',
+      '✅',
+      'Seu horário está garantido. Aguardamos você com muito carinho!'
+    ));
+  } else {
+    return res.status(500).send(paginaResposta(
+      'Ops, algo deu errado',
+      '#f44336',
+      '😕',
+      'Não conseguimos confirmar automaticamente. Por favor, responda esta mensagem com a palavra CONFIRMAR.'
+    ));
+  }
+});
+
+app.get('/cancelar', async (req, res) => {
+  const id = req.query.id;
+  console.log(`👉 Cliente clicou em CANCELAR para o agendamento ${id}`);
+
+  if (!id) {
+    return res.status(400).send(paginaResposta('Link inválido', '#f44336', '⚠️', 'O link não contém um agendamento válido.'));
+  }
+
+  const sucesso = await atualizarStatusNoFirebase(id, 'Cancelado');
+
+  if (sucesso) {
+    return res.send(paginaResposta(
+      'Agendamento Cancelado',
+      '#f44336',
+      '❌',
+      'Seu horário foi cancelado. Esperamos ver você em breve!'
+    ));
+  } else {
+    return res.status(500).send(paginaResposta(
+      'Ops, algo deu errado',
+      '#f44336',
+      '😕',
+      'Não conseguimos cancelar automaticamente. Por favor, responda esta mensagem com a palavra CANCELAR.'
+    ));
+  }
+});
+
+// ============================================================
 
 const PORTA = process.env.PORT || 3000;
 app.listen(PORTA, () => {
