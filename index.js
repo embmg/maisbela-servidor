@@ -166,6 +166,19 @@ async function iniciarConexaoWhatsApp() {
         return;
       }
 
+      // ============================================================
+      // CORREÇÃO PRINCIPAL: tratamento do erro 408 (Timeout)
+      // Mantém a sessão salva e reconecta sem gerar novo QR Code.
+      // ============================================================
+      if (motivo === 408) {
+        console.log('⏱️ Erro 408 (Timeout). Reconectando sem apagar a sessão...');
+        statusConexao = 'reconectando';
+        setTimeout(() => {
+          iniciarConexaoWhatsApp();
+        }, 3000);
+        return;
+      }
+
       if (tentandoReconectar) return;
       tentandoReconectar = true;
       statusConexao = 'desconectado';
