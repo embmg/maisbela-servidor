@@ -16,7 +16,7 @@ const {
 const app = express();
 app.use(express.json());
 
-const CHAVE_SECRETA = process.env.CHAVE_SECRETA || 'troque-esta-chave-1234';
+const CHAVE_SECRETA = 'Sil.1826';
 const PASTA_SESSAO = 'auth_info';
 
 // ===================== CONFIGURAÇÃO FIREBASE =====================
@@ -40,7 +40,6 @@ function normalizarTexto(texto) {
     .trim();
 }
 
-// ===================== FUNÇÃO QUE ATUALIZA O FIREBASE =====================
 async function atualizarStatusNoFirebase(idAgendamento, novoStatus) {
   if (!FIREBASE_API_KEY) {
     console.error('⚠️ FIREBASE_API_KEY não configurada nas variáveis de ambiente.');
@@ -78,7 +77,6 @@ async function atualizarStatusNoFirebase(idAgendamento, novoStatus) {
     return false;
   }
 }
-// ==========================================================================
 
 async function iniciarConexaoWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(PASTA_SESSAO);
@@ -166,10 +164,6 @@ async function iniciarConexaoWhatsApp() {
         return;
       }
 
-      // ============================================================
-      // CORREÇÃO PRINCIPAL: tratamento do erro 408 (Timeout)
-      // Mantém a sessão salva e reconecta sem gerar novo QR Code.
-      // ============================================================
       if (motivo === 408) {
         console.log('⏱️ Erro 408 (Timeout). Reconectando sem apagar a sessão...');
         statusConexao = 'reconectando';
@@ -278,10 +272,6 @@ app.get('/status', (req, res) => {
   res.json({ status: statusConexao, ultimoMotivoDesconexao });
 });
 
-// ============================================================
-// ROTAS DE CONFIRMAÇÃO E CANCELAMENTO (as páginas que a cliente vê)
-// ============================================================
-
 function paginaResposta(titulo, cor, emoji, mensagem) {
   return `
     <!DOCTYPE html>
@@ -359,9 +349,8 @@ app.get('/cancelar', async (req, res) => {
   }
 });
 
-// ============================================================
-
 const PORTA = process.env.PORT || 3000;
 app.listen(PORTA, () => {
   console.log(`Servidor do MaisBela rodando na porta ${PORTA}`);
+  console.log(`Chave secreta ativa: ${CHAVE_SECRETA}`);
 });
