@@ -310,7 +310,7 @@ app.get('/confirmar', async (req, res) => {
       'Agendamento Confirmado!',
       '#4CAF50',
       '✅',
-      'Seu horário está garantido. Aguardamos você com muito carinho!'
+      'Seu horário está garantido. Aguardamos você!'
     ));
   } else {
     return res.status(500).send(paginaResposta(
